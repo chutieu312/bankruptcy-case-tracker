@@ -1,0 +1,48 @@
+spring:
+  application:
+    name: bankruptcy-case-tracker
+
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:casetracker}
+    username: ${DB_USER:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: true
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+server:
+  port: 8080
+  servlet:
+    context-path: /api
+
+security:
+  jwt:
+    secret: ${JWT_SECRET:change-this-secret-in-production-min-32-chars-long}
+    expiration-ms: 900000        # 15 minutes
+    refresh-expiration-ms: 604800000  # 7 days
+
+aws:
+  region: ${AWS_REGION:us-east-1}
+  endpoint: ${AWS_ENDPOINT:http://localhost:4566}   # LocalStack override
+  access-key: ${AWS_ACCESS_KEY_ID:test}
+  secret-key: ${AWS_SECRET_ACCESS_KEY:test}
+  s3:
+    bucket: ${S3_BUCKET:case-documents}
+  sqs:
+    notification-queue-url: ${SQS_QUEUE_URL:http://localhost:4566/000000000000/case-notifications}
+
+logging:
+  level:
+    com.strettodemo: DEBUG
+    org.springframework.security: INFO

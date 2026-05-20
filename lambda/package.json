@@ -1,0 +1,9 @@
+{
+  "name": "case-notification-lambda",
+  "version": "1.0.0",
+  "description": "SQS consumer Lambda - notifies on case status changes",
+  "main": "handler.js",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.540.0"
+  }
+}
