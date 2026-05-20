@@ -61,9 +61,9 @@ git push -u origin main
 
 GitHub will prompt for your credentials the first time. If you use HTTPS, create a [Personal Access Token](https://github.com/settings/tokens) and use it as the password.
 
-### 2 — Generate the frontend lockfile (one-time)
+### 2 — Generate the frontend lockfile (first-time clone only)
 
-Docker uses `npm ci` which requires a `package-lock.json`. Run this once after cloning:
+Docker uses `npm ci` which requires a `package-lock.json`. This file is already committed to the repo, so **you only need this step if `frontend/package-lock.json` is missing**:
 
 ```bash
 cd frontend
