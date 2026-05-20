@@ -1,7 +1,5 @@
 # Bankruptcy Case Tracker
 
-A full-stack demo project built to showcase the technical skills required for the **Stretto Full Stack Software Engineer** role.
-
 ---
 
 ## Tech Stack
