@@ -46,3 +46,14 @@ logging:
   level:
     com.strettodemo: DEBUG
     org.springframework.security: INFO
+
+# ── Springdoc / Swagger UI ───────────────────────────────────────────────────
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+    operationsSorter: method
+    tagsSorter: alpha
+    try-it-out-enabled: true
+    display-request-duration: true
