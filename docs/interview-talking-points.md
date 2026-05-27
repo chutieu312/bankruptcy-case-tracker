@@ -65,21 +65,329 @@
 
 *(JD sourced from `docs/jd-practice-plan.md` — Stretto Full Stack Software Engineer)*
 
-| JD Skill | What I Built | Example Code | How To Explain It |
-|---|---|---|---|
-| **Java + Spring Boot** | Spring Boot 3.2 REST API — auth, cases, documents modules | ```java<br>@PatchMapping("/{id}/status")<br>public Case updateStatus(<br>        @PathVariable Long id,<br>        @RequestParam CaseStatus status) {<br>    return caseService.updateStatus(id, status);<br>}<br>``` | "I followed the standard Spring Boot layered architecture. Controllers handle HTTP concerns only — all business logic lives in the Service layer." |
-| **Hibernate + Spring JPA** | `Case`, `User`, `Document` entities; `CaseRepository` with custom JPQL | ```java<br>@Query("""<br>    SELECT c FROM Case c<br>    LEFT JOIN FETCH c.assignedTo<br>    WHERE (:status IS NULL OR c.status = :status)<br>      AND (:debtorName IS NULL OR LOWER(c.debtorName)<br>           LIKE LOWER(CONCAT('%',<br>                CAST(:debtorName AS String), '%')))<br>    ORDER BY c.filingDate DESC<br>    """)<br>Page<Case> searchCases(<br>    @Param("status") Case.CaseStatus status,<br>    @Param("debtorName") String debtorName,<br>    Pageable pageable);<br>``` | "Each filter short-circuits when `null` so one JPQL query handles every combination. `LEFT JOIN FETCH` on `assignedTo` loads the related user in the same SQL — no N+1." |
-| **Node.js** | `lambda/handler.js` SQS consumer | ```javascript<br>exports.handler = async (event) => {<br>  for (const record of event.Records) {<br>    const payload = JSON.parse(record.body);<br>    if (payload.eventType === "CASE_STATUS_CHANGED") {<br>      await handleCaseStatusChanged(payload);<br>    }<br>  }<br>  return { batchItemFailures: [] };<br>};<br>``` | "The Lambda iterates SQS records individually. Returning `batchItemFailures: []` signals all messages succeeded — one bad message doesn't poison the rest of the batch." |
-| **TypeScript + ReactJS** | React 18 SPA with TypeScript interfaces, React Router v6 | ```typescript<br>const load = useCallback(async () => {<br>  setLoading(true)<br>  try {<br>    const [pageData, summaryData] = await Promise.all([<br>      casesApi.search({ ...filters, page: currentPage }),<br>      casesApi.summary(),<br>    ])<br>    setPage(pageData)<br>    setSummary(summaryData)<br>  } finally { setLoading(false) }<br>}, [filters, currentPage])<br>``` | "`useCallback` memoises the load function; `Promise.all` fetches the case list and summary cards in parallel — two API calls in one render cycle." |
-| **CSS / HTML** | Tailwind CSS 3.4, semantic HTML5 in JSX | ```typescript<br>const STATUS_COLORS: Record<CaseStatus, string> = {<br>  OPEN:      'bg-green-100 text-green-800',<br>  CLOSED:    'bg-gray-100  text-gray-700',<br>  DISMISSED: 'bg-red-100   text-red-700',<br>  CONVERTED: 'bg-yellow-100 text-yellow-800',<br>}<br>``` | "Tailwind utility classes for a responsive layout. Status badge colours are driven by a TypeScript `Record` — zero custom CSS." |
-| **AWS S3** | `DocumentService.java` — PutObject + presigned GetObject | ```java<br>s3Client.putObject(<br>    PutObjectRequest.builder()<br>        .bucket(bucket).key(s3Key)<br>        .contentType(file.getContentType()).build(),<br>    RequestBody.fromBytes(file.getBytes()));<br>// ...<br>s3Presigner.presignGetObject(<br>    GetObjectPresignRequest.builder()<br>        .signatureDuration(Duration.ofMinutes(15))<br>        .getObjectRequest(r -><br>            r.bucket(bucket).key(doc.getS3Key()))<br>        .build());<br>``` | "The backend uploads to S3 and returns a pre-signed URL. The browser downloads directly from S3 — the API never proxies file bytes, keeping memory usage flat." |
-| **AWS SQS** | `NotificationService.java` — `@Async` SendMessage on status change | ```java<br>@Async<br>public void sendCaseStatusChangeNotification(<br>        Long caseId, String caseNumber,<br>        String oldStatus, String newStatus) {<br>    Map<String, Object> payload = Map.of(<br>        "eventType", "CASE_STATUS_CHANGED",<br>        "caseId",    caseId,<br>        "oldStatus", oldStatus,<br>        "newStatus", newStatus,<br>        "timestamp", Instant.now().toString());<br>    sqsClient.sendMessage(SendMessageRequest.builder()<br>        .queueUrl(queueUrl)<br>        .messageBody(objectMapper.writeValueAsString(payload))<br>        .build());<br>}<br>``` | "`@Async` lets the status update return to the caller instantly while the SQS send runs on a background thread. If SQS is unavailable, the case update still succeeds." |
-| **AWS Lambda** | `lambda/handler.js` — SQS-triggered Node.js handler | *(see Node.js row above)* | "A serverless consumer — Node.js 20 is a lightweight fit for an event-driven function. In production this would call SES for email or SNS for push, simulated here with LocalStack." |
-| **Complex SQL queries** | JPQL `searchCases()` with 5 optional filters + pagination; `countByStatus()` aggregation | ```sql<br>CREATE INDEX idx_cases_status<br>    ON cases(status);<br>CREATE INDEX idx_cases_filing_date<br>    ON cases(filing_date);<br>CREATE INDEX idx_cases_assigned<br>    ON cases(assigned_to_id);<br>CREATE INDEX idx_documents_case<br>    ON documents(case_id);<br>``` | "I added explicit indexes for the four most common query predicates. Without them, status and date-range searches would be full-table scans as case volume grows." |
-| **CI/CD pipelines** | GitHub Actions — backend-test → frontend-test → docker-build | ```yaml<br>jobs:<br>  backend-test:<br>    services:<br>      postgres:<br>        image: postgres:15-alpine<br>  frontend-test:<br>    steps:<br>      - run: npm ci<br>      - run: npm run test<br>  docker-build:<br>    needs: [backend-test, frontend-test]<br>    if: github.ref == 'refs/heads/main'<br>``` | "Backend and frontend test jobs run in parallel. Docker build only triggers when both pass AND the branch is main — no broken images reach the registry." |
-| **Security** | BCrypt(12), JWT 15-min expiry, CORS whitelist, `@Valid` Bean Validation | ```java<br>return http<br>  .csrf(AbstractHttpConfigurer::disable)<br>  .cors(cors -> cors.configurationSource(<br>      corsConfigurationSource()))<br>  .sessionManagement(s -><br>      s.sessionCreationPolicy(STATELESS))<br>  .authorizeHttpRequests(auth -> auth<br>      .requestMatchers(POST,<br>          "/auth/login", "/auth/register").permitAll()<br>      .anyRequest().authenticated())<br>  .addFilterBefore(jwtAuthFilter,<br>      UsernamePasswordAuthenticationFilter.class)<br>  .build();<br>``` | "Stateless session, CSRF disabled (JWT makes it irrelevant), CORS locked to known origins, and a custom JWT filter that runs before Spring's default auth filter." |
-| **Agile / Scrum** | Phased build plan in `jd-practice-plan.md`, feature-branch + PR workflow | *(process, not a code snippet)* | "I structured the project as eight phased sprints in the practice plan — each phase with a clear deliverable, mirroring how I'd work in a Scrum team." |
-| **AI Tools (GitHub Copilot)** | Used throughout for boilerplate, test scaffolding, SQL queries | *(tooling, not a code snippet)* | "I used GitHub Copilot to accelerate boilerplate and test scaffolding — listed as a preferred skill in the JD. I reviewed all generated code carefully; it's a fast first draft, not a final answer." |
+---
+
+### Java + Spring Boot
+
+#### JD Skill
+Java + Spring Boot
+
+#### What I Built
+Spring Boot 3.2 REST API — auth, cases, documents modules
+
+#### Example Code
+```java
+@PatchMapping("/{id}/status")
+public Case updateStatus(
+        @PathVariable Long id,
+        @RequestParam CaseStatus status) {
+    return caseService.updateStatus(id, status);
+}
+```
+
+#### How To Explain It
+"I followed the standard Spring Boot layered architecture. Controllers handle HTTP concerns only — all business logic lives in the Service layer."
+
+---
+
+### Hibernate + Spring JPA
+
+#### JD Skill
+Hibernate + Spring JPA
+
+#### What I Built
+`Case`, `User`, `Document` entities; `CaseRepository` with custom JPQL
+
+#### Example Code
+```java
+@Query("""
+    SELECT c FROM Case c
+    LEFT JOIN FETCH c.assignedTo
+    WHERE (:status IS NULL OR c.status = :status)
+      AND (:debtorName IS NULL OR LOWER(c.debtorName)
+           LIKE LOWER(CONCAT('%',
+                CAST(:debtorName AS String), '%')))
+    ORDER BY c.filingDate DESC
+    """)
+Page<Case> searchCases(
+    @Param("status") Case.CaseStatus status,
+    @Param("debtorName") String debtorName,
+    Pageable pageable);
+```
+
+#### How To Explain It
+"Each filter short-circuits when `null` so one JPQL query handles every combination. `LEFT JOIN FETCH` on `assignedTo` loads the related user in the same SQL — no N+1."
+
+---
+
+### Node.js
+
+#### JD Skill
+Node.js
+
+#### What I Built
+`lambda/handler.js` SQS consumer
+
+#### Example Code
+```javascript
+exports.handler = async (event) => {
+  for (const record of event.Records) {
+    const payload = JSON.parse(record.body);
+    if (payload.eventType === "CASE_STATUS_CHANGED") {
+      await handleCaseStatusChanged(payload);
+    }
+  }
+  return { batchItemFailures: [] };
+};
+```
+
+#### How To Explain It
+"The Lambda iterates SQS records individually. Returning `batchItemFailures: []` signals all messages succeeded — one bad message doesn't poison the rest of the batch."
+
+---
+
+### TypeScript + ReactJS
+
+#### JD Skill
+TypeScript + ReactJS
+
+#### What I Built
+React 18 SPA with TypeScript interfaces, React Router v6
+
+#### Example Code
+```typescript
+const load = useCallback(async () => {
+  setLoading(true)
+  try {
+    const [pageData, summaryData] = await Promise.all([
+      casesApi.search({ ...filters, page: currentPage }),
+      casesApi.summary(),
+    ])
+    setPage(pageData)
+    setSummary(summaryData)
+  } finally { setLoading(false) }
+}, [filters, currentPage])
+```
+
+#### How To Explain It
+"`useCallback` memoises the load function; `Promise.all` fetches the case list and summary cards in parallel — two API calls in one render cycle."
+
+---
+
+### CSS / HTML
+
+#### JD Skill
+CSS / HTML
+
+#### What I Built
+Tailwind CSS 3.4, semantic HTML5 in JSX
+
+#### Example Code
+```typescript
+const STATUS_COLORS: Record<CaseStatus, string> = {
+  OPEN:      'bg-green-100 text-green-800',
+  CLOSED:    'bg-gray-100  text-gray-700',
+  DISMISSED: 'bg-red-100   text-red-700',
+  CONVERTED: 'bg-yellow-100 text-yellow-800',
+}
+```
+
+#### How To Explain It
+"Tailwind utility classes for a responsive layout. Status badge colours are driven by a TypeScript `Record` — zero custom CSS."
+
+---
+
+### AWS S3
+
+#### JD Skill
+AWS S3
+
+#### What I Built
+`DocumentService.java` — PutObject + presigned GetObject
+
+#### Example Code
+```java
+s3Client.putObject(
+    PutObjectRequest.builder()
+        .bucket(bucket).key(s3Key)
+        .contentType(file.getContentType()).build(),
+    RequestBody.fromBytes(file.getBytes()));
+
+// Generate a 15-minute pre-signed download URL
+s3Presigner.presignGetObject(
+    GetObjectPresignRequest.builder()
+        .signatureDuration(Duration.ofMinutes(15))
+        .getObjectRequest(r ->
+            r.bucket(bucket).key(doc.getS3Key()))
+        .build());
+```
+
+#### How To Explain It
+"The backend uploads to S3 and returns a pre-signed URL. The browser downloads directly from S3 — the API never proxies file bytes, keeping memory usage flat."
+
+---
+
+### AWS SQS
+
+#### JD Skill
+AWS SQS
+
+#### What I Built
+`NotificationService.java` — `@Async` SendMessage on status change
+
+#### Example Code
+```java
+@Async
+public void sendCaseStatusChangeNotification(
+        Long caseId, String caseNumber,
+        String oldStatus, String newStatus) {
+    Map<String, Object> payload = Map.of(
+        "eventType", "CASE_STATUS_CHANGED",
+        "caseId",    caseId,
+        "oldStatus", oldStatus,
+        "newStatus", newStatus,
+        "timestamp", Instant.now().toString());
+    sqsClient.sendMessage(SendMessageRequest.builder()
+        .queueUrl(queueUrl)
+        .messageBody(objectMapper.writeValueAsString(payload))
+        .build());
+}
+```
+
+#### How To Explain It
+"`@Async` lets the status update return to the caller instantly while the SQS send runs on a background thread. If SQS is unavailable, the case update still succeeds."
+
+---
+
+### AWS Lambda
+
+#### JD Skill
+AWS Lambda
+
+#### What I Built
+`lambda/handler.js` — SQS-triggered Node.js 20 handler
+
+#### Example Code
+*(see Node.js section above — same handler file)*
+
+#### How To Explain It
+"A serverless consumer — Node.js 20 is a lightweight fit for an event-driven function. In production this would call SES for email or SNS for push; here it's simulated with LocalStack."
+
+---
+
+### Complex SQL Queries
+
+#### JD Skill
+Complex SQL queries
+
+#### What I Built
+Flyway migration V1 with 5 targeted indexes; JPQL `searchCases()` with 5 optional filters + pagination; `countByStatus()` GROUP BY aggregation
+
+#### Example Code
+```sql
+CREATE INDEX idx_cases_status
+    ON cases(status);
+CREATE INDEX idx_cases_filing_date
+    ON cases(filing_date);
+CREATE INDEX idx_cases_assigned
+    ON cases(assigned_to_id);
+CREATE INDEX idx_documents_case
+    ON documents(case_id);
+```
+
+#### How To Explain It
+"I added explicit indexes for the four most common query predicates. Without them, status and date-range searches would be full-table scans as case volume grows."
+
+---
+
+### CI/CD Pipelines
+
+#### JD Skill
+CI/CD pipelines
+
+#### What I Built
+GitHub Actions — `backend-test` → `frontend-test` → `docker-build`
+
+#### Example Code
+```yaml
+jobs:
+  backend-test:
+    services:
+      postgres:
+        image: postgres:15-alpine
+  frontend-test:
+    steps:
+      - run: npm ci
+      - run: npm run test
+  docker-build:
+    needs: [backend-test, frontend-test]
+    if: github.ref == 'refs/heads/main'
+```
+
+#### How To Explain It
+"Backend and frontend test jobs run in parallel. Docker build only triggers when both pass AND the branch is main — no broken images reach the registry."
+
+---
+
+### Security
+
+#### JD Skill
+Security vulnerability remediation
+
+#### What I Built
+BCrypt(12), JWT 15-min expiry, CORS whitelist, `@Valid` Bean Validation
+
+#### Example Code
+```java
+return http
+  .csrf(AbstractHttpConfigurer::disable)
+  .cors(cors -> cors.configurationSource(
+      corsConfigurationSource()))
+  .sessionManagement(s ->
+      s.sessionCreationPolicy(STATELESS))
+  .authorizeHttpRequests(auth -> auth
+      .requestMatchers(POST,
+          "/auth/login", "/auth/register").permitAll()
+      .anyRequest().authenticated())
+  .addFilterBefore(jwtAuthFilter,
+      UsernamePasswordAuthenticationFilter.class)
+  .build();
+```
+
+#### How To Explain It
+"Stateless session, CSRF disabled (JWT makes it irrelevant), CORS locked to known origins, and a custom JWT filter that runs before Spring's default auth filter."
+
+---
+
+### Agile / Scrum
+
+#### JD Skill
+Agile / Scrum
+
+#### What I Built
+Phased build plan in `jd-practice-plan.md`, feature-branch + PR workflow
+
+#### Example Code
+*(process discipline — no code snippet)*
+
+#### How To Explain It
+"I structured the project as eight phased sprints in the practice plan — each phase with a clear deliverable, mirroring how I'd work in a Scrum team."
+
+---
+
+### AI Tools (GitHub Copilot)
+
+#### JD Skill
+AI Tools — GitHub Copilot
+
+#### What I Built
+Used throughout for boilerplate, test scaffolding, SQL queries
+
+#### Example Code
+*(tooling — no code snippet)*
+
+#### How To Explain It
+"I used GitHub Copilot to accelerate boilerplate and test scaffolding — listed as a preferred skill in the JD. I reviewed all generated code carefully; it's a fast first draft, not a final answer."
 
 ---
 
