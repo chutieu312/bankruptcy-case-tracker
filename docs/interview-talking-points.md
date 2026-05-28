@@ -393,100 +393,581 @@ Used throughout for boilerplate, test scaffolding, SQL queries
 
 ## 5. Backend Talking Points
 
-### API Design
-"I followed a standard layered architecture: Controller → Service → Repository. The context path is `/api`, so all endpoints are under `/api/cases`, `/api/auth`, etc. Every controller method does nothing except call the service — no business logic leaks into controllers."
+```mermaid
+flowchart TD
+    Client -->|HTTP Request| JwtAuthFilter
+    JwtAuthFilter -->|validated| Controller
+    Controller -->|"@Valid + call"| Service
+    Service -->|JPA| Repository
+    Repository -->|"SQL + LIMIT/OFFSET"| PostgreSQL[(PostgreSQL)]
+    Service -.->|"@Async sendMessage"| SQS[(SQS Queue)]
+    Service -->|"putObject / presignUrl"| S3[(S3 Bucket)]
+```
 
-"Pagination uses Spring's `Pageable` — the client passes `?page=0&size=10&sort=filingDate,desc` and gets back a `Page<Case>` with `totalElements` and `totalPages` included. This is interview-ready because it shows I understand paging without rolling my own."
+### API Design
+
+**How It Works:**
+"I followed a standard layered architecture: Controller → Service → Repository. The context path is `/api`, so all endpoints are under `/api/cases`, `/api/auth`, etc. Every controller method does nothing except call the service — no business logic leaks into controllers. Pagination uses Spring's `Pageable` — the client passes `?page=0&size=10&sort=filingDate,desc` and gets back a `Page<Case>` with `totalElements` and `totalPages` included."
+
+**Example Code:**
+```java
+@GetMapping
+public Page<Case> search(
+        @RequestParam(required = false) CaseStatus status,
+        @RequestParam(required = false) Short chapter,
+        @RequestParam(required = false) String debtorName,
+        @RequestParam(required = false)
+        @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate fromDate,
+        @RequestParam(required = false)
+        @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate toDate,
+        @PageableDefault(size = 20, sort = "filingDate") Pageable pageable) {
+    return caseService.search(status, chapter, debtorName, fromDate, toDate, pageable);
+}
+```
+
+**How To Explain It:**
+"Every `@RequestParam` is `required = false` — the client can combine any subset of filters. `@PageableDefault` sets safe defaults so the caller doesn't have to specify page/size on every request. Paging is interview-ready because it shows I understand pagination without rolling my own."
+
+---
 
 ### Business Logic
+
+**How It Works:**
 "The most interesting business rule is the status change flow: when a user calls `PATCH /cases/{id}/status`, the service updates the record and then calls `NotificationService.sendCaseStatusChangeNotification()`. That method is `@Async` — it fires and forgets to SQS without blocking the HTTP response."
 
+**Example Code:**
+```java
+@Transactional
+public Case updateStatus(Long id, CaseStatus newStatus) {
+    Case c = getById(id);
+    String oldStatus = c.getStatus().name();
+    c.setStatus(newStatus);
+    Case saved = caseRepository.save(c);
+    notificationService.sendCaseStatusChangeNotification(
+            saved.getId(), saved.getCaseNumber(),
+            oldStatus, newStatus.name());
+    return saved;
+}
+```
+
+**How To Explain It:**
+"`@Transactional` ensures the DB write succeeds or rolls back atomically. The `@Async` SQS call happens after the commit — if SQS is down, the status change still persists. The caller gets the updated case immediately."
+
+---
+
 ### Validation
-"I use Spring's `@Valid` on every `@RequestBody`. The `CaseRequest` is a Java record with `@NotBlank`, `@NotNull`, and `@Min`/`@Max` annotations. If validation fails, Spring throws `MethodArgumentNotValidException` and my `GlobalExceptionHandler` catches it and returns a structured 400 with field-level error messages."
+
+**How It Works:**
+"I use Spring's `@Valid` on every `@RequestBody`. The `CaseRequest` is a Java record with constraint annotations. If validation fails, Spring throws `MethodArgumentNotValidException` and my `GlobalExceptionHandler` returns a structured 400 with field-level messages."
+
+**Example Code:**
+```java
+public record CaseRequest(
+        @NotBlank String caseNumber,
+        @NotBlank String debtorName,
+        @NotNull @Min(7) @Max(13) Short chapter,
+        @NotNull LocalDate filingDate,
+        String courtDistrict, String judgeName,
+        String trusteeName, String notes, Long assignedToId
+) {}
+```
+
+**How To Explain It:**
+"Bean Validation runs before the controller body executes — invalid input never reaches the service layer. `@Min(7) @Max(13)` ensures only valid bankruptcy chapters (7, 11, 13) are accepted."
+
+---
 
 ### Database Access
-"For simple lookups I rely on Spring Data derived queries — `findById`, `findByEmail`. For the case search I wrote a JPQL query with five optional filters using `(:param IS NULL OR condition)` so unset filters are effectively skipped. Pagination and sorting are delegated to Hibernate, which generates efficient SQL with LIMIT/OFFSET."
 
-**One gotcha I hit and fixed:** "Hibernate 6 with PostgreSQL can't infer the type of a null parameter — it sends it as `bytea`, which breaks `LOWER()`. I fixed it by casting the parameter: `CAST(:debtorName AS String)` in JPQL. That was a real Hibernate 6 + PostgreSQL interaction bug I debugged and resolved."
+**How It Works:**
+"For simple lookups I rely on Spring Data derived queries — `findById`, `findByEmail`. For the case search I wrote a JPQL query with five optional filters using `(:param IS NULL OR condition)` so unset filters are effectively skipped."
+
+**Example Code:**
+```java
+@Query("""
+        SELECT c FROM Case c
+        LEFT JOIN FETCH c.assignedTo
+        WHERE (:status IS NULL OR c.status = :status)
+          AND (:chapter IS NULL OR c.chapter = :chapter)
+          AND (:debtorName IS NULL OR LOWER(c.debtorName)
+               LIKE LOWER(CONCAT('%',
+                    CAST(:debtorName AS String), '%')))
+          AND (:fromDate IS NULL OR c.filingDate >= :fromDate)
+          AND (:toDate   IS NULL OR c.filingDate <= :toDate)
+        ORDER BY c.filingDate DESC
+        """)
+Page<Case> searchCases(
+        @Param("status") Case.CaseStatus status,
+        @Param("chapter") Short chapter,
+        @Param("debtorName") String debtorName,
+        @Param("fromDate") LocalDate fromDate,
+        @Param("toDate") LocalDate toDate,
+        Pageable pageable);
+```
+
+**How To Explain It:**
+"`LEFT JOIN FETCH c.assignedTo` prevents N+1 queries on the list page. I hit a real Hibernate 6 + PostgreSQL bug — null parameters were sent as `bytea`, breaking `LOWER()`. The fix was `CAST(:debtorName AS String)` in JPQL."
+
+---
 
 ### Error Handling
-"I have a `@RestControllerAdvice` global handler that maps exceptions to HTTP status codes: `EntityNotFoundException` → 404, `MethodArgumentNotValidException` → 400, `BadCredentialsException` → 401, everything else → 500. The 500 handler also logs the full stack trace, so silent errors don't happen."
+
+**How It Works:**
+"I have a `@RestControllerAdvice` global handler that maps exceptions to HTTP status codes. The 500 handler logs the full stack trace so silent errors don't happen."
+
+**Example Code:**
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+    @ExceptionHandler(EntityNotFoundException.class)
+    public ProblemDetail handleNotFound(EntityNotFoundException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, ex.getMessage());
+    }
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+        String detail = ex.getBindingResult().getFieldErrors().stream()
+                .map(e -> e.getField() + ": " + e.getDefaultMessage())
+                .collect(Collectors.joining(", "));
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, detail);
+    }
+    @ExceptionHandler(BadCredentialsException.class)
+    public ProblemDetail handleBadCredentials(BadCredentialsException ex) {
+        return ProblemDetail.forStatusAndDetail(HttpStatus.UNAUTHORIZED,
+                "Invalid email or password");
+    }
+    @ExceptionHandler(Exception.class)
+    public ProblemDetail handleGeneric(Exception ex) {
+        log.error("Unhandled exception", ex);
+        return ProblemDetail.forStatusAndDetail(HttpStatus.INTERNAL_SERVER_ERROR,
+                "An unexpected error occurred");
+    }
+}
+```
+
+**How To Explain It:**
+"`ProblemDetail` is the RFC 7807 standard response format — Spring Boot 3 supports it natively. `EntityNotFoundException` → 404, `MethodArgumentNotValidException` → 400, `BadCredentialsException` → 401. The generic 500 handler ensures no raw stack traces leak to the client."
+
+---
 
 ### Performance Considerations
-"I added five indexes in the V1 schema migration: `idx_cases_status`, `idx_cases_chapter`, `idx_cases_filing_date`, `idx_cases_assigned`, `idx_documents_case`. These cover the most common WHERE and JOIN columns. In production I'd use `EXPLAIN ANALYZE` to verify the query plan."
+
+**How It Works:**
+"I added five database indexes in the V1 Flyway migration covering the most common WHERE and JOIN columns."
+
+**Example Code:**
+```sql
+CREATE INDEX idx_cases_status      ON cases(status);
+CREATE INDEX idx_cases_chapter     ON cases(chapter);
+CREATE INDEX idx_cases_filing_date ON cases(filing_date);
+CREATE INDEX idx_cases_assigned    ON cases(assigned_to_id);
+CREATE INDEX idx_documents_case    ON documents(case_id);
+```
+
+**How To Explain It:**
+"Without `idx_documents_case`, loading documents for a case would do a full table scan as the documents table grows. The status and filing_date indexes support the most common filter combinations. In production I'd run `EXPLAIN ANALYZE` to verify the query plan."
+
+---
 
 ### Trade-offs Made for Simplicity
+
+**How It Works:**
+"Several architectural simplifications were made deliberately for this demo scope."
+
+**Example Code:**
+*(design decisions — no single code snippet)*
+
+**How To Explain It:**
 - "JWT tokens are stateless — there's no token blacklist, so logout just means deleting the token on the client. In production I'd add a Redis-backed token revocation store or use refresh + short-lived access tokens."
-- "Lazy loading is enabled (default JPA behaviour). For the cases list I serialize only the case fields, not nested collections — I added `@JsonIgnore` on the `documents` field and `@JsonIgnoreProperties` on lazy-loaded User proxies to prevent `ByteBuddyInterceptor` serialization errors."
-- "The API uses Tomcat's default thread pool — no explicit async servlet configuration. For heavy upload traffic I'd consider switching to virtual threads (Java 21) or a reactive stack."
+- "Lazy loading is enabled (default JPA behaviour). I added `@JsonIgnore` on the `documents` field and `@JsonIgnoreProperties` on lazy-loaded User proxies to prevent `ByteBuddyInterceptor` serialization errors."
+- "The API uses Tomcat's default thread pool. For heavy upload traffic I'd consider switching to virtual threads (Java 21) or a reactive stack."
 
 ---
 
 ## 6. Frontend Talking Points
 
-### UI Structure
-"The app has four pages: Login, Cases List, Case Detail, and a Register page. I used React Router v6's `<Routes>` for navigation and a context-based auth guard — unauthenticated users are redirected to `/login` automatically."
+```mermaid
+flowchart TD
+    User -->|action / filter change| Component
+    Component -->|useCallback load| APIClient["Axios client.ts"]
+    APIClient -->|request interceptor injects Bearer token| Backend["Spring Boot API"]
+    Backend -->|JSON Page response| APIClient
+    APIClient -->|"response interceptor 401 → /login"| Component
+    APIClient -->|setState pageData + summaryData| Component
+    Component -->|  re-render with STATUS_COLORS  | User
+```
 
-"The `CasesPage` has two sections: a summary row of four status cards at the top (driven by `GET /cases/summary`) and a filterable, paginated table below (driven by `GET /cases`). Both API calls fire in parallel using `Promise.all` to minimise latency."
+### UI Structure
+
+**How It Works:**
+"The app has four pages: Login, Cases List, Case Detail, and a Register page. React Router v6's `<Routes>` handles navigation with a context-based auth guard. The `CasesPage` fires two API calls in parallel using `Promise.all` — status summary cards at the top and the filterable, paginated table below."
+
+**Example Code:**
+```typescript
+const load = useCallback(async () => {
+  setLoading(true)
+  try {
+    const [pageData, summaryData] = await Promise.all([
+      casesApi.search({
+        debtorName: filters.debtorName || undefined,
+        status: filters.status || undefined,
+        chapter: filters.chapter || undefined,
+        page: currentPage,
+        size: 10,
+      }),
+      casesApi.summary(),
+    ])
+    setPage(pageData)
+    setSummary(summaryData)
+  } finally { setLoading(false) }
+}, [filters, currentPage])
+```
+
+**How To Explain It:**
+"`Promise.all` fires both API calls concurrently — the page renders in one round-trip instead of two sequential requests. `useCallback` memoises the load function so it doesn't re-create on every render, preventing infinite effect loops."
+
+---
 
 ### State Management
-"I kept state management simple — `useState` and `useCallback` in each page component, no Redux or Zustand. The `useCallback` on the `load` function prevents infinite re-render loops when filter state or page number changes. For auth state I used a React Context (`AuthContext`) so any component can read the current user and token."
 
-"If the app scaled to dozens of pages I'd introduce React Query — it gives caching, background refetch, and loading/error states out of the box without manual state boilerplate."
+**How It Works:**
+"I kept state management simple — `useState` and `useCallback` in each page component, no Redux or Zustand. Auth state lives in `AuthContext` so any component can read the current user and token without prop drilling."
+
+**Example Code:**
+```typescript
+const login = useCallback(async (email: string, password: string) => {
+  const data = await authApi.login(email, password)
+  localStorage.setItem('token', data.token)
+  localStorage.setItem('fullName', data.fullName)
+  localStorage.setItem('role', data.role)
+  setAuth({ token: data.token, fullName: data.fullName, role: data.role })
+}, [])
+// isAuthenticated: !!auth.token
+```
+
+**How To Explain It:**
+"`AuthContext` is exported so any component can consume it — and it's easy to mock in Storybook or tests. If the app scaled to dozens of pages I'd introduce React Query — it gives caching, background refetch, and loading/error states out of the box."
+
+---
 
 ### API Integration
-"I centralised all API calls in `frontend/src/api/`. The Axios instance has a request interceptor that reads the JWT from `localStorage` and injects the `Authorization: Bearer <token>` header automatically. This means no page component has to think about auth headers."
+
+**How It Works:**
+"I centralised all API calls in `frontend/src/api/`. The Axios instance has two interceptors: a request interceptor that injects the JWT header, and a response interceptor that handles 401s by clearing storage and redirecting to `/login`."
+
+**Example Code:**
+```typescript
+const api = axios.create({
+  baseURL: '/api',
+  headers: { 'Content-Type': 'application/json' },
+})
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('token')
+  if (token) { config.headers.Authorization = `Bearer ${token}` }
+  return config
+})
+api.interceptors.response.use(
+  (res) => res,
+  (err) => {
+    if (err.response?.status === 401) {
+      localStorage.removeItem('token')
+      window.location.href = '/login'
+    }
+    return Promise.reject(err)
+  }
+)
+```
+
+**How To Explain It:**
+"The interceptors act as middleware — no page component ever touches auth headers or handles 401s manually. If the token expires mid-session, the user is automatically redirected to login on the next API call."
+
+---
 
 ### User Experience
-"Status badges use a `STATUS_COLORS` TypeScript Record — each status maps to a Tailwind class pair (e.g. `OPEN` → `bg-green-100 text-green-800`). Filtering is reactive — changing any filter or page triggers a new API call. Loading state shows a skeleton-style 'Loading…' indicator."
+
+**How It Works:**
+"Status badges use a TypeScript `Record` mapping each status to a Tailwind CSS class pair. Filtering is reactive — changing any filter or page triggers a new API call."
+
+**Example Code:**
+```typescript
+const STATUS_COLORS: Record<CaseStatus, string> = {
+  OPEN:      'bg-green-100 text-green-800',
+  CLOSED:    'bg-gray-100  text-gray-700',
+  DISMISSED: 'bg-red-100   text-red-700',
+  CONVERTED: 'bg-yellow-100 text-yellow-800',
+}
+```
+
+**How To Explain It:**
+"TypeScript's `Record<CaseStatus, string>` makes the map exhaustive — if a new status is added to the enum, the compiler will flag a missing color mapping before it ever reaches production."
+
+---
 
 ### Trade-offs Made for Simplicity
+
+**How It Works:**
+"Several frontend simplifications were deliberate for demo scope."
+
+**Example Code:**
+*(design decisions — no single code snippet)*
+
+**How To Explain It:**
 - "No React Query or SWR — I manage loading/error state manually with `useState`. Simple enough for this size, but I'd adopt React Query in production."
 - "JWT stored in `localStorage` — convenient but vulnerable to XSS. In production I'd store the token in an httpOnly cookie."
-- "No optimistic UI updates — status changes re-fetch the full page after success. Fine for demo, but a real app would update local state immediately and roll back on error."
+- "No optimistic UI updates — status changes re-fetch the full page after success. A real app would update local state immediately and roll back on error."
 
 ---
 
 ## 7. Database Talking Points
 
+```mermaid
+erDiagram
+    USERS ||--o{ CASES : "assigned_to_id"
+    USERS ||--o{ CASES : "created_by_id"
+    CASES ||--o{ DOCUMENTS : "case_id (ON DELETE CASCADE)"
+    USERS {
+        bigint id PK
+        varchar email UK
+        varchar password
+        varchar full_name
+        varchar role
+    }
+    CASES {
+        bigint id PK
+        varchar case_number UK
+        varchar debtor_name
+        smallint chapter
+        varchar status
+        date filing_date
+        bigint assigned_to_id FK
+        bigint created_by_id FK
+    }
+    DOCUMENTS {
+        bigint id PK
+        bigint case_id FK
+        varchar file_name
+        varchar s3_key UK
+        bigint file_size_bytes
+    }
+```
+
 ### Schema Design
-"Three tables: `users`, `cases`, `documents`. `cases` has a foreign key to `users` twice — `assigned_to_id` (the attorney handling the case) and `created_by_id` (audit trail). `documents` has a foreign key to `cases` with `ON DELETE CASCADE` — deleting a case removes all its documents automatically."
+
+**How It Works:**
+"Three tables: `users`, `cases`, `documents`. `cases` has two foreign keys to `users` — `assigned_to_id` (the attorney handling the case) and `created_by_id` (audit trail). `documents` has a foreign key to `cases` with `ON DELETE CASCADE`."
+
+**Example Code:**
+```sql
+CREATE TABLE cases (
+  id            BIGSERIAL PRIMARY KEY,
+  case_number   VARCHAR(100) NOT NULL UNIQUE,
+  debtor_name   VARCHAR(255) NOT NULL,
+  chapter       SMALLINT NOT NULL,
+  status        VARCHAR(50)  NOT NULL DEFAULT 'OPEN',
+  filing_date   DATE NOT NULL,
+  assigned_to_id BIGINT REFERENCES users(id),
+  created_by_id  BIGINT REFERENCES users(id),
+  created_at    TIMESTAMP NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMP NOT NULL DEFAULT NOW()
+);
+CREATE TABLE documents (
+  id              BIGSERIAL PRIMARY KEY,
+  case_id         BIGINT NOT NULL REFERENCES cases(id) ON DELETE CASCADE,
+  file_name       VARCHAR(255) NOT NULL,
+  s3_key          VARCHAR(500) NOT NULL UNIQUE,
+  content_type    VARCHAR(100),
+  file_size_bytes BIGINT,
+  uploaded_by_id  BIGINT REFERENCES users(id),
+  uploaded_at     TIMESTAMP NOT NULL DEFAULT NOW()
+);
+```
+
+**How To Explain It:**
+"The dual FK on `cases` (`assigned_to_id` vs `created_by_id`) models two distinct relationships — who owns the case vs who originally created it. `ON DELETE CASCADE` on documents means the application never needs a manual cleanup step when a case is removed."
+
+---
 
 ### Relationships
-"It's a classic one-to-many: one case has many documents, one user can be assigned to many cases. In JPA I mapped these as `@ManyToOne` on the document side and `@OneToMany(mappedBy, fetch = LAZY)` on the case side. I kept all collections lazy to avoid N+1 queries on list endpoints."
+
+**How It Works:**
+"One case has many documents; one user can be assigned to many cases. In JPA these are `@ManyToOne` on the owning side and `@OneToMany(fetch = LAZY)` on the parent. All collections are lazy to avoid N+1 on list endpoints."
+
+**Example Code:**
+```java
+// On Document entity
+@ManyToOne(fetch = FetchType.LAZY)
+@JoinColumn(name = "case_id")
+private Case case;
+
+// On Case entity
+@OneToMany(mappedBy = "case", fetch = FetchType.LAZY)
+@JsonIgnore
+private List<Document> documents;
+
+@ManyToOne(fetch = FetchType.LAZY)
+@JoinColumn(name = "assigned_to_id")
+@JsonIgnoreProperties({"hibernateLazyInitializer", "handler"})
+private User assignedTo;
+```
+
+**How To Explain It:**
+"`@JsonIgnore` on `documents` prevents the full document list serialising on every case response. `@JsonIgnoreProperties` on lazy-loaded proxies avoids `ByteBuddyInterceptor` serialization errors that Hibernate 6 throws when you try to serialize an uninitialized proxy."
+
+---
 
 ### Queries
-"The interesting query is `searchCases()` in `CaseRepository`. It's a JPQL query with five optional filters. Each condition is written as `(:param IS NULL OR entity.field = :param)` — if the caller passes `null`, the condition is always true and effectively skipped. This avoids building dynamic queries with Criteria API or string concatenation."
 
-"The summary query `countByStatus()` uses a JPQL `GROUP BY` — it returns `List<Object[]>` which I convert to a `Map<String, Long>` in the service. That map goes straight to the frontend as JSON for the dashboard cards."
+**How It Works:**
+"The interesting query is `searchCases()` — five optional filters in one JPQL statement. Each condition is `(:param IS NULL OR condition)` so unset filters are always true and effectively skipped."
+
+**Example Code:**
+```java
+@Query("""
+        SELECT c FROM Case c
+        LEFT JOIN FETCH c.assignedTo
+        WHERE (:status IS NULL OR c.status = :status)
+          AND (:chapter IS NULL OR c.chapter = :chapter)
+          AND (:debtorName IS NULL OR LOWER(c.debtorName)
+               LIKE LOWER(CONCAT('%',
+                    CAST(:debtorName AS String), '%')))
+          AND (:fromDate IS NULL OR c.filingDate >= :fromDate)
+          AND (:toDate   IS NULL OR c.filingDate <= :toDate)
+        ORDER BY c.filingDate DESC
+        """)
+Page<Case> searchCases(/* @Param params */, Pageable pageable);
+
+@Query("SELECT c.status AS status, COUNT(c) AS total FROM Case c GROUP BY c.status")
+List<StatusCount> countByStatus();
+```
+
+**How To Explain It:**
+"`countByStatus()` returns a projection interface `StatusCount` — cleaner than `List<Object[]>`. The service converts it to `Map<String, Long>` for the frontend dashboard cards. No N+1, no dynamic query building."
+
+---
 
 ### Indexing
-"Five indexes on the most-queried columns: `status`, `chapter`, `filing_date`, `assigned_to_id`, and `documents.case_id`. Without the `case_id` index, loading documents for a case would do a full table scan. The others speed up the WHERE clauses in the search query."
+
+**How It Works:**
+"Five indexes on the most-queried columns cover every WHERE predicate and FK join in the application."
+
+**Example Code:**
+```sql
+CREATE INDEX idx_cases_status      ON cases(status);
+CREATE INDEX idx_cases_chapter     ON cases(chapter);
+CREATE INDEX idx_cases_filing_date ON cases(filing_date);
+CREATE INDEX idx_cases_assigned    ON cases(assigned_to_id);
+CREATE INDEX idx_documents_case    ON documents(case_id);
+```
+
+**How To Explain It:**
+"Without `idx_documents_case`, every `SELECT … WHERE case_id = ?` would be a full table scan. `idx_cases_filing_date` supports date-range filters with a range scan. In production I'd run `EXPLAIN ANALYZE` on the search query to verify index usage."
+
+---
 
 ### Trade-offs
-- "No full-text search — debtor name search uses SQL `LIKE '%name%'`, which can't use a B-tree index. For production I'd add a PostgreSQL GIN index with `pg_trgm` or move to Elasticsearch for full-text case search."
-- "`updated_at` is set on insert and never auto-updated by the DB — I rely on Hibernate's `@PreUpdate`. In production I'd use a database trigger as a safety net."
+
+**How It Works:**
+"Some DB design decisions were simplified for the demo."
+
+**Example Code:**
+*(design decisions — no code snippet)*
+
+**How To Explain It:**
+- "No full-text search — debtor name search uses SQL `LIKE '%name%'` which can't use a B-tree index. For production I'd add a PostgreSQL GIN index with `pg_trgm` or move to Elasticsearch."
+- "`updated_at` is managed by Hibernate's `@PreUpdate`. In production I'd add a database trigger as a safety net for any out-of-ORM updates."
+
+---
 
 ### What I Would Improve for Production
 1. Add `pg_trgm` GIN index on `debtor_name` for fast fuzzy search
 2. Add read replicas — all list/search queries go to the replica, writes go to primary
-3. Add connection pooling (HikariCP is already Spring Boot's default — I'd tune `maximumPoolSize` based on load testing)
+3. Tune HikariCP `maximumPoolSize` based on load testing (it's already Spring Boot's default pool)
 4. Partition `cases` by `filing_date` for historical data archival
 
 ---
 
 ## 8. Cloud Talking Points
 
+```mermaid
+flowchart LR
+    API["Spring Boot API"] -->|"putObject UUID key"| S3[("S3\ncase-documents")]
+    API -->|"presignGetObject 15min"| S3
+    API -->|"@Async sendMessage JSON"| SQS[("SQS\ncase-notifications")]
+    SQS -->|event trigger| Lambda["Node.js 20 Lambda"]
+    LocalStack["LocalStack 3.4"] -.->|simulates port 4566| S3
+    LocalStack -.->|simulates port 4566| SQS
+```
+
 ### Services Used / Simulated
-"I use three AWS services: S3 for document storage, SQS for async notifications, and Lambda (simulated) as the SQS consumer. All three run locally via LocalStack 3.4 in Docker — same API surface as real AWS, so switching to a real AWS account is just an environment variable change (swap the endpoint from `http://localstack:4566` to nothing, and provide real credentials)."
+
+**How It Works:**
+"I use three AWS services: S3 for document storage, SQS for async notifications, and Lambda as the SQS consumer. All three run locally via LocalStack 3.4 in Docker — same API surface as real AWS, so switching is just an environment variable change."
+
+**Example Code:**
+```yaml
+# application.yml
+aws:
+  endpoint: ${AWS_ENDPOINT:http://localhost:4566}
+  s3:
+    bucket: ${S3_BUCKET:case-documents}
+  sqs:
+    notification-queue-url: ${SQS_QUEUE_URL:http://localhost:4566/000000000000/case-notifications}
+```
+
+**How To Explain It:**
+"All AWS config comes from environment variables. In Docker Compose `AWS_ENDPOINT` points to `http://localstack:4566`. In production ECS you remove the endpoint override and provide IAM role credentials — zero code changes required."
+
+---
 
 ### Why These Services Make Sense
-- **S3**: "Case documents — PDFs, spreadsheets — don't belong in a relational database. S3 is infinitely scalable, durable, and cheap. Pre-signed URLs mean the API never proxies file bytes — S3 handles the download directly."
-- **SQS**: "Status change notifications are a natural fit for a queue. The API doesn't need to know who's consuming the event — it just publishes to the queue. This decouples the API from email sending, webhook delivery, or audit logging. If the consumer is down, messages are retained and retried."
-- **Lambda**: "A serverless consumer is perfect here — the workload is bursty (events happen when cases change), not continuous. Lambda scales to zero when idle and scales out automatically under load."
+
+**How It Works:**
+"S3 for blobs, SQS for decoupling, Lambda for serverless event processing — each service is the right tool for its workload type."
+
+**Example Code:**
+```java
+// S3 upload + pre-signed download
+String s3Key = "cases/" + caseId + "/" + UUID.randomUUID() + "_" + file.getOriginalFilename();
+s3Client.putObject(
+        PutObjectRequest.builder().bucket(bucket).key(s3Key)
+                .contentType(file.getContentType()).build(),
+        RequestBody.fromBytes(file.getBytes()));
+
+PresignedGetObjectRequest presigned = s3Presigner.presignGetObject(
+        GetObjectPresignRequest.builder()
+                .signatureDuration(Duration.ofMinutes(15))
+                .getObjectRequest(r -> r.bucket(bucket).key(doc.getS3Key()))
+                .build());
+return presigned.url().toString();
+```
+
+**How To Explain It:**
+"Pre-signed URLs mean the API never proxies file bytes — S3 handles the download directly, keeping API memory usage flat. The 15-minute expiry limits the window for URL leakage."
+
+---
 
 ### How This Maps to the JD
-"The Stretto JD calls out EC2, ECS, Lambda, S3, and SQS specifically. I've covered S3, SQS, and Lambda directly. For EC2/ECS — that's the deployment target. I'd containerise the Spring Boot API (already done) and push it to ECR, then deploy to ECS Fargate. The GitHub Actions pipeline is already structured to support that."
+
+**How It Works:**
+"The Stretto JD calls out EC2, ECS, Lambda, S3, and SQS specifically. I've covered S3, SQS, and Lambda. EC2/ECS is the deployment target for the containerised API."
+
+**Example Code:**
+```javascript
+// lambda/handler.js — SQS consumer
+exports.handler = async (event) => {
+  for (const record of event.Records) {
+    const payload = JSON.parse(record.body);
+    if (payload.eventType === "CASE_STATUS_CHANGED") {
+      await handleCaseStatusChanged(payload);
+    }
+  }
+  return { batchItemFailures: [] };
+};
+```
+
+**How To Explain It:**
+"`batchItemFailures: []` signals all records succeeded. In production the handler would call SES for email or SNS for push notifications. Returning partial failures prevents SQS from re-delivering only the failed records — critical for avoiding duplicate notifications."
+
+---
 
 ### What I Would Improve for Production
 1. Use IAM roles instead of static `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` — ECS tasks get instance role credentials automatically
@@ -499,41 +980,255 @@ Used throughout for boilerplate, test scaffolding, SQL queries
 
 ## 9. CI/CD Talking Points
 
+```mermaid
+flowchart TD
+    Push(["git push / PR to main"]) --> BT["backend-test\nJava 21 + Postgres 15"]
+    Push --> FT["frontend-test\nNode 20 + Vitest"]
+    BT --> DB["docker-build"]
+    FT --> DB
+    DB -->|"if: refs/heads/main only"| DockerHub[("DockerHub\nbct-api:sha + latest\nbct-frontend:sha + latest")]
+```
+
 ### Build
-"The GitHub Actions workflow triggers on push to `main` or `develop`, and on PRs targeting `main`. The first job, `backend-test`, uses `actions/setup-java@v4` with `distribution: temurin` and caches Maven dependencies to speed up repeated runs. It runs `mvn verify -q` which compiles, runs tests, and checks the package."
+
+**How It Works:**
+"The GitHub Actions workflow triggers on push to `main` or `develop`, and on PRs targeting `main`. `backend-test` uses `actions/setup-java@v4` with `distribution: temurin` and runs `mvn verify -q`."
+
+**Example Code:**
+```yaml
+backend-test:
+  runs-on: ubuntu-latest
+  services:
+    postgres:
+      image: postgres:15-alpine
+      env:
+        POSTGRES_DB: casetracker_test
+        POSTGRES_USER: casetracker
+        POSTGRES_PASSWORD: casetracker
+      options: >-
+        --health-cmd pg_isready
+        --health-interval 10s
+        --health-timeout 5s
+        --health-retries 5
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-java@v4
+      with: { java-version: '21', distribution: temurin, cache: maven }
+    - run: mvn verify -q
+  env:
+    DB_HOST: localhost
+    JWT_SECRET: ci-test-secret-key-minimum-32-characters
+    AWS_ENDPOINT: http://localhost:4566
+```
+
+**How To Explain It:**
+"The `services` block spins up a real Postgres 15 container alongside the job. The `--health-cmd pg_isready` option means GitHub Actions waits until Postgres is accepting connections before running tests — no flaky 'connection refused' errors."
+
+---
 
 ### Test
-"Backend tests run against a real Postgres 15 container — not H2. I use GitHub Actions' `services` block to spin up a Postgres service container alongside the job. This means the tests exercise real PostgreSQL query behaviour, including the Hibernate 6 / JPQL quirks I hit in development."
 
-"Frontend tests run `npm ci` (uses the committed `package-lock.json` for deterministic installs) then `npm run test` which runs Vitest in CI mode."
+**How It Works:**
+"Backend tests run against real PostgreSQL — not H2. Frontend tests use `npm ci` for deterministic installs then Vitest in CI mode."
+
+**Example Code:**
+```yaml
+frontend-test:
+  runs-on: ubuntu-latest
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-node@v4
+      with: { node-version: '20', cache: npm, cache-dependency-path: frontend/package-lock.json }
+    - run: npm ci
+      working-directory: frontend
+    - run: npx tsc --noEmit
+      working-directory: frontend
+    - run: npm run test
+      working-directory: frontend
+```
+
+**How To Explain It:**
+"`npx tsc --noEmit` runs the TypeScript compiler as a type-check without emitting files — it catches type errors that Vitest wouldn't. `npm ci` (not `npm install`) uses `package-lock.json` for deterministic, reproducible installs."
+
+---
 
 ### Docker Image
-"The `docker-build` job depends on both test jobs passing — it only runs on pushes to `main`. It builds both the backend and frontend Docker images to validate that the multi-stage builds complete without error. In a production extension I'd add a `docker push` step to push to ECR or Docker Hub."
+
+**How It Works:**
+"The `docker-build` job uses multi-stage Dockerfiles. Backend: Maven build → minimal JRE runtime. Frontend: Node build → nginx static file server."
+
+**Example Code:**
+```dockerfile
+# backend/Dockerfile
+FROM maven:3.9.7-eclipse-temurin-21 AS build
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:go-offline -q
+COPY src ./src
+RUN mvn package -DskipTests -q
+
+FROM eclipse-temurin:21-jre-jammy
+RUN addgroup --system appgroup \
+ && adduser --system --ingroup appgroup appuser
+USER appuser
+COPY --from=build /app/target/*.jar app.jar
+EXPOSE 8080
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+**How To Explain It:**
+"The `dependency:go-offline` layer is cached separately from the source copy — rebuilds only re-download dependencies when `pom.xml` changes. The non-root `appuser` follows the principle of least privilege — a compromised container can't write to the host filesystem as root."
+
+---
 
 ### Deployment
-"The pipeline doesn't deploy automatically in the current setup — that's a deliberate simplification. The logical next step would be a `deploy` job triggered on tags or manual dispatch that pushes images to ECR and updates an ECS service definition."
+
+**How It Works:**
+"The `docker-build` job depends on both test jobs and runs only on `main`. It pushes images to DockerHub with both a SHA tag and `latest`."
+
+**Example Code:**
+```yaml
+docker-build:
+  needs: [backend-test, frontend-test]
+  if: github.ref == 'refs/heads/main'
+  steps:
+    - uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/bct-api:${{ github.sha }}
+          ${{ secrets.DOCKERHUB_USERNAME }}/bct-api:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+```
+
+**How To Explain It:**
+"SHA tags enable pinned deployments — you always know exactly which commit is running in production. `latest` is for convenience. GitHub Actions cache (`type=gha`) speeds up layer reuse across runs."
+
+---
 
 ### Rollback / Safety Checks
-"The dependency chain is the safety gate: tests must pass before Docker builds, and Docker builds would gate deployments. For rollback, ECS supports rolling deployment with a previous task definition — you can roll back by re-registering the previous task definition revision."
+
+**How It Works:**
+"The dependency chain is the safety gate: tests must pass before Docker builds, and Docker builds gate deployments."
+
+**Example Code:**
+*(pipeline dependency graph — see Mermaid diagram above)*
+
+**How To Explain It:**
+"For rollback, ECS supports rolling deployment with task definition revisions — you roll back by re-registering the previous revision. The SHA-tagged image in ECR ensures the exact previous build is always available."
+
+---
 
 ### What This Demonstrates for Interview
-"This pipeline shows I understand the three pillars of CI/CD: automated verification (tests), artefact creation (Docker images), and deployment automation. The postgres service container in the backend-test job is a detail most candidates miss — it shows I know the difference between unit tests with mocks and integration tests against a real database."
+
+**How It Works:**
+"This pipeline covers the three pillars of CI/CD: automated verification, artefact creation, and deployment automation."
+
+**Example Code:**
+*(design rationale — no single code snippet)*
+
+**How To Explain It:**
+"The Postgres service container in `backend-test` is a detail most candidates miss — it shows I know the difference between unit tests with mocks and integration tests against a real database. The `if: github.ref == 'refs/heads/main'` guard prevents feature branch pushes from flooding the image registry."
 
 ---
 
 ## 10. Testing Talking Points
 
 ### Unit Tests (`CaseServiceTest.java`)
-"I tested `CaseService` in isolation using Mockito. I mocked `CaseRepository`, `UserRepository`, and `NotificationService`, then injected them with `@InjectMocks`. Three key tests:
-1. `create_shouldSaveCaseWithOpenStatus` — verifies new cases always start as OPEN
-2. `getById_whenNotFound_shouldThrow` — verifies 404 behavior
-3. `updateStatus_shouldPublishSqsNotification` — verifies the SQS `sendCaseStatusChangeNotification` is called with the correct old/new status"
+
+**How It Works:**
+"I tested `CaseService` in isolation using Mockito. I mocked `CaseRepository`, `UserRepository`, and `NotificationService`, then injected them with `@InjectMocks`."
+
+**Example Code:**
+```java
+@Test
+void updateStatus_shouldPublishSqsNotification() {
+    Case existingCase = new Case();
+    existingCase.setId(1L);
+    existingCase.setCaseNumber("CH7-2024-001");
+    existingCase.setStatus(CaseStatus.OPEN);
+    when(caseRepository.findById(1L)).thenReturn(Optional.of(existingCase));
+    when(caseRepository.save(any(Case.class))).thenAnswer(i -> i.getArgument(0));
+
+    caseService.updateStatus(1L, CaseStatus.CLOSED);
+
+    verify(notificationService).sendCaseStatusChangeNotification(
+            eq(1L), eq("CH7-2024-001"), eq("OPEN"), eq("CLOSED"));
+}
+```
+
+**How To Explain It:**
+"This test verifies the SQS notification is called with the correct old and new status strings. If someone refactors `updateStatus` and removes the notification call, this test catches it immediately. `@InjectMocks` + `@ExtendWith(MockitoExtension.class)` — no Spring context, runs in milliseconds."
+
+---
 
 ### Integration Tests (`CaseControllerTest.java`)
-"I used `@WebMvcTest` to test the controller layer with a mocked `CaseService`. This validates that the HTTP routing, request mapping, and response serialization work correctly — without starting a full Spring context or hitting a database."
+
+**How It Works:**
+"I used `@WebMvcTest` to test the controller layer with a mocked `CaseService`. This validates HTTP routing, request mapping, and response serialization without starting a full context or hitting a database."
+
+**Example Code:**
+```java
+@WebMvcTest(CaseController.class)
+class CaseControllerTest {
+    @Autowired MockMvc mockMvc;
+    @MockBean CaseService caseService;
+
+    @Test
+    @WithMockUser
+    void GET_cases_shouldReturnPage() throws Exception {
+        when(caseService.search(any(), any(), any(), any(), any(), any()))
+                .thenReturn(new PageImpl<>(List.of()));
+
+        mockMvc.perform(get("/cases"))
+               .andExpect(status().isOk())
+               .andExpect(jsonPath("$.content").isArray());
+    }
+
+    @Test
+    void GET_cases_unauthenticated_shouldReturn401() throws Exception {
+        mockMvc.perform(get("/cases"))
+               .andExpect(status().isUnauthorized());
+    }
+}
+```
+
+**How To Explain It:**
+"`@WebMvcTest` boots only the web layer — Spring MVC, Jackson, and security filters. `@WithMockUser` injects a mock principal so authenticated tests don't need a real JWT. The unauthenticated test verifies the security config actually rejects anonymous requests."
+
+---
 
 ### Frontend Tests (`CasesPage.test.tsx`)
-"I used Vitest with React Testing Library. I mocked the entire `@/api` module with `vi.mock()` so no real HTTP calls are made. The test renders `CasesPage` inside a `MemoryRouter`, resolves the mocked API promises, and asserts that the case data and status summary cards appear in the DOM."
+
+**How It Works:**
+"I used Vitest with React Testing Library. The entire `@/api` module is mocked with `vi.mock()` so no real HTTP calls are made."
+
+**Example Code:**
+```typescript
+vi.mock('@/api', () => ({
+  casesApi: {
+    search: vi.fn().mockResolvedValue({
+      content: [{ id: 1, caseNumber: 'CH7-2024-001',
+                  debtorName: 'John Doe', status: 'OPEN', chapter: 7 }],
+      totalPages: 1, totalElements: 1,
+    }),
+    summary: vi.fn().mockResolvedValue({ OPEN: 1 }),
+  },
+}))
+
+it('renders case list and status summary', async () => {
+  render(<MemoryRouter><CasesPage /></MemoryRouter>)
+  expect(await screen.findByText('CH7-2024-001')).toBeInTheDocument()
+  expect(screen.getByText('John Doe')).toBeInTheDocument()
+})
+```
+
+**How To Explain It:**
+"`vi.mock()` replaces the entire API module at the module boundary — the component code doesn't change at all. `findByText` is async — it waits for React to resolve the mocked promises and re-render. This tests the full component render cycle, not just snapshot matching."
+
+---
 
 ### What Risks the Tests Cover
 - Service-layer business logic bugs (wrong status on create, missing SQS call)
@@ -541,31 +1236,168 @@ Used throughout for boilerplate, test scaffolding, SQL queries
 - UI rendering with real async data loading
 - TypeScript type contract between API responses and UI components
 
+---
+
 ### What Additional Tests I Would Add in Production
-1. **Testcontainers**: Spin up a real PostgreSQL container in CI and run the JPQL search query end-to-end — verifies the Hibernate 6 / PostgreSQL type inference fix I made
+1. **Testcontainers**: Spin up a real PostgreSQL container and run the JPQL search query end-to-end — verifies the Hibernate 6 / PostgreSQL type inference fix
 2. **Spring Boot `@SpringBootTest`** with full context for auth filter integration testing
 3. **MSW (Mock Service Worker)**: Frontend API mocking at the network level — more realistic than mocking the Axios module
 4. **Playwright E2E**: Login → create case → upload document → change status → verify SQS message logged
-5. **Security tests**: Verify that unauthenticated requests to `/cases` return 401, and ROLE-restricted endpoints return 403
+5. **Security tests**: Verify unauthenticated requests to `/cases` return 401, and ROLE-restricted endpoints return 403
 
 ---
 
 ## 11. Security Talking Points
 
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as Spring Boot API
+    participant JwtAuthFilter
+    participant SecurityContext
+    participant Controller
+
+    Client->>+API: POST /auth/login {email, password}
+    API->>API: DaoAuthenticationProvider.authenticate()
+    API->>API: BCrypt(12).matches()
+    API->>API: JwtService.generateToken() HMAC-SHA256
+    API-->>-Client: 200 { token, fullName, role }
+
+    Client->>+JwtAuthFilter: GET /api/cases (Authorization: Bearer token)
+    JwtAuthFilter->>JwtAuthFilter: extractUsername(token)
+    JwtAuthFilter->>JwtAuthFilter: isTokenValid() + !isTokenExpired()
+    JwtAuthFilter->>SecurityContext: setAuthentication(UsernamePasswordAuthenticationToken)
+    SecurityContext->>+Controller: authenticated request
+    Controller-->>-Client: 200 Page<Case>
+```
+
 ### Authentication
-"I implemented JWT-based stateless authentication using JJWT 0.12.5 with HMAC-SHA256 signing. The secret key is injected from an environment variable — never hardcoded. Tokens expire in 15 minutes (`expiration-ms: 900000`). The JWT filter intercepts every request, extracts the token from the `Authorization: Bearer` header, validates the signature and expiry, and sets the `SecurityContext`."
+
+**How It Works:**
+"JWT-based stateless authentication using JJWT 0.12.5 with HMAC-SHA256 signing. The secret key is injected from an environment variable. Tokens expire in 15 minutes. The JWT filter runs on every request as a `OncePerRequestFilter`."
+
+**Example Code:**
+```java
+// JwtAuthFilter.doFilterInternal
+String authHeader = request.getHeader("Authorization");
+if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+    filterChain.doFilter(request, response); return;
+}
+String token = authHeader.substring(7);
+String username = jwtService.extractUsername(token);
+if (username != null
+        && SecurityContextHolder.getContext().getAuthentication() == null) {
+    userRepository.findByEmail(username).ifPresent(user -> {
+        if (jwtService.isTokenValid(token, user)) {
+            var auth = new UsernamePasswordAuthenticationToken(
+                    user, null, user.getAuthorities());
+            auth.setDetails(new WebAuthenticationDetailsSource()
+                    .buildDetails(request));
+            SecurityContextHolder.getContext().setAuthentication(auth);
+        }
+    });
+}
+filterChain.doFilter(request, response);
+```
+
+**How To Explain It:**
+"The filter only sets the `SecurityContext` if no authentication already exists — prevents double-processing. `OncePerRequestFilter` guarantees it runs exactly once per HTTP request even in servlet forwarding scenarios."
+
+---
 
 ### Authorization
-"Spring Security's `SecurityConfig` defines the authorization rules: `/auth/login`, `/auth/register`, and `/actuator/health` are public. Everything else requires authentication. The three roles (ADMIN, ATTORNEY, TRUSTEE) are stored in the `users` table and loaded by `UserDetailsService` — they're available for `@PreAuthorize` annotations if role-based access control needs to be tightened."
+
+**How It Works:**
+"Spring Security's `SecurityConfig` defines authorization rules. The three roles (ADMIN, ATTORNEY, TRUSTEE) are stored in the `users` table and loaded by `UserDetailsService`."
+
+**Example Code:**
+```java
+.authorizeHttpRequests(auth -> auth
+    .requestMatchers(HttpMethod.POST,
+        "/auth/login", "/auth/register").permitAll()
+    .requestMatchers("/actuator/health").permitAll()
+    .requestMatchers("/swagger-ui/**", "/v3/api-docs/**").permitAll()
+    .anyRequest().authenticated()
+)
+.addFilterBefore(jwtAuthFilter,
+    UsernamePasswordAuthenticationFilter.class)
+```
+
+**How To Explain It:**
+"Allowlisting is safer than denylisting — I explicitly permit a small set of public endpoints and require authentication for everything else. `addFilterBefore` places the JWT filter ahead of Spring's default username/password filter so the JWT path is evaluated first."
+
+---
 
 ### Input Validation
-"Every `@RequestBody` is annotated with `@Valid`. The `CaseRequest` record uses Jakarta Validation annotations — `@NotBlank` on required strings, `@NotNull` on dates, and `@Min`/`@Max` on chapter numbers. Invalid input returns a structured 400 response with per-field error messages — no raw exception stack traces leak to the client."
+
+**How It Works:**
+"Every `@RequestBody` is annotated with `@Valid`. Invalid input returns a structured 400 response with per-field error messages — no raw stack traces leak to the client."
+
+**Example Code:**
+```java
+@ExceptionHandler(MethodArgumentNotValidException.class)
+public ProblemDetail handleValidation(MethodArgumentNotValidException ex) {
+    String detail = ex.getBindingResult().getFieldErrors().stream()
+            .map(e -> e.getField() + ": " + e.getDefaultMessage())
+            .collect(Collectors.joining(", "));
+    return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, detail);
+}
+```
+
+**How To Explain It:**
+"The response tells the client exactly which fields failed and why — enough to fix the request without exposing implementation details. `ProblemDetail` (RFC 7807) is the standard format; Spring Boot 3 supports it natively."
+
+---
 
 ### Secrets Management
-"In the current Docker Compose setup, secrets (JWT secret, DB password, AWS credentials) are passed as environment variables. For production I'd use AWS Secrets Manager or HashiCorp Vault — the app would load secrets at startup via Spring Cloud Vault or the AWS SDK, not from environment variables baked into a task definition."
+
+**How It Works:**
+"All secrets are injected via environment variables — never hardcoded. The JWT secret falls back to a placeholder in development but is required in production."
+
+**Example Code:**
+```yaml
+# application.yml
+security:
+  jwt:
+    secret: ${JWT_SECRET:change-this-secret-key-minimum-32-chars}
+    expiration-ms: 900000
+aws:
+  endpoint: ${AWS_ENDPOINT:http://localhost:4566}
+  access-key: ${AWS_ACCESS_KEY_ID:test}
+  secret-key: ${AWS_SECRET_ACCESS_KEY:test}
+```
+
+**How To Explain It:**
+"The `${VAR:default}` syntax provides a safe fallback for local development while requiring real values in production. In production I'd use AWS Secrets Manager — the app fetches the secret at startup via the AWS SDK, so credentials never appear in task definitions or environment variable lists."
+
+---
 
 ### CORS / API Security
-"The `SecurityConfig` configures CORS to allow only `localhost:5173` (dev) and `localhost:3000` (Docker). In production this would be the specific frontend domain. All preflight OPTIONS requests are permitted by the CORS config."
+
+**How It Works:**
+"The `SecurityConfig` configures CORS to allow only known frontend origins. CSRF is disabled because JWT-based stateless auth doesn't use cookies."
+
+**Example Code:**
+```java
+@Bean
+public CorsConfigurationSource corsConfigurationSource() {
+    CorsConfiguration config = new CorsConfiguration();
+    config.setAllowedOrigins(List.of(
+        "http://localhost:5173",   // Vite dev server
+        "http://localhost:3000"    // Docker nginx
+    ));
+    config.setAllowedMethods(List.of(
+        "GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"));
+    config.setAllowedHeaders(List.of("*"));
+    config.setAllowCredentials(true);
+    // ...
+}
+```
+
+**How To Explain It:**
+"Explicit origin allowlist prevents other domains from making credentialed requests to the API. CSRF is safe to disable here because the browser can't send a JWT from `localStorage` cross-site — CSRF attacks rely on cookies being sent automatically. In production this list would contain only the deployed frontend domain."
+
+---
 
 ### Production Improvements
 1. Move JWT to httpOnly cookies to prevent XSS token theft
