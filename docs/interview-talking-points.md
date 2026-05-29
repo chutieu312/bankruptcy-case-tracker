@@ -1553,6 +1553,46 @@ public CorsConfigurationSource corsConfigurationSource() {
 
 ---
 
+**Q11: How does your Node.js Lambda function consume SQS messages, and why is Node.js a good fit for it?**
+
+> **Strong answer:** "The handler lives in `lambda/handler.js` and exports an async function that receives the SQS event. It iterates over `event.Records`, parses the JSON body from each record, and dispatches to `handleCaseStatusChanged()` when `eventType === 'CASE_STATUS_CHANGED'`. It returns `{ batchItemFailures: [] }` to tell SQS all records were processed successfully. If a single record fails inside the loop, the try/catch isolates the error to that record only — the rest of the batch still succeeds. As for why Node.js: it's lightweight, has a fast cold-start time, and the V8 event loop is ideal for I/O-bound work like calling SES or SNS. There's no JVM startup overhead, which matters when Lambda scales from zero."
+
+> **What they're testing:** Node.js knowledge, Lambda event contract, SQS batch processing mechanics.
+
+> **Follow-up:** "What would happen if `handleCaseStatusChanged` threw an uncaught error? How would you surface partial batch failures?"
+
+---
+
+**Q12: How did you approach styling in the frontend? What is the `STATUS_COLORS` pattern and why did you use it?**
+
+> **Strong answer:** "I used Tailwind CSS 3.4 — utility-first classes applied directly in JSX, no custom CSS files at all. The layout uses a responsive Tailwind grid: `grid grid-cols-2 md:grid-cols-4 gap-4` for the status summary cards, which stacks to 2 columns on mobile and expands to 4 on medium screens. For status badge colouring I defined a TypeScript `Record<CaseStatus, string>` called `STATUS_COLORS` that maps each enum value to a Tailwind class pair — for example `OPEN` maps to `bg-green-100 text-green-800`. Using a `Record` gives compile-time exhaustiveness checking: if someone adds a new `CaseStatus` enum value without updating the map, the TypeScript compiler flags it before it reaches production. The alternative would have been a switch/case or if/else chain, which is both harder to scan and not exhaustiveness-checked."
+
+> **What they're testing:** CSS/HTML knowledge, TypeScript type safety, understanding of utility-first CSS.
+
+> **Follow-up:** "How would you add a dark-mode variant for those badges with Tailwind?"
+
+---
+
+**Q13: How did you structure your development process for this project?**
+
+> **Strong answer:** "I treated it like a mini Scrum project. I started by reading the JD and extracting all required and preferred skills, then grouped them into a skills matrix. From that I defined a phased build plan in `docs/jd-practice-plan.md` — eight phases, each with a clear deliverable: Phase 1 was project setup and Docker Compose, Phase 2 was the database schema and Flyway migrations, Phase 3 the Spring Boot API layer, and so on through frontend, AWS integration, tests, and CI/CD. Each phase was small enough to complete and verify before moving on — similar to a one-day sprint with a definition of done. I used feature branches and treated each phase as a PR-ready unit of work. This mirrors how I'd work in a Scrum team: incremental delivery, testable after each increment, and the ability to demo at any phase boundary."
+
+> **What they're testing:** Agile/Scrum process knowledge, self-management, ability to break down work.
+
+> **Follow-up:** "How would you estimate the effort for a feature like 'add full-text search on debtor name' in a real sprint?"
+
+---
+
+**Q14: You used GitHub Copilot during this project — how did it fit into your workflow, and what are its limits?**
+
+> **Strong answer:** "I used Copilot throughout, but with a clear mental model of what it's good at and where you have to be careful. It's excellent for boilerplate — entity classes, repository interfaces, Dockerfile structure, GitHub Actions YAML — things with a well-known pattern where the main value is just not having to type it out. I also used it to scaffold test method stubs: I'd write the method name like `updateStatus_shouldPublishSqsNotification` and let Copilot suggest the body, then I'd review and correct the mock setup. Where I *don't* lean on it: business logic, security configuration, and anything with subtle constraints like the `@Min(7) @Max(13)` on chapter numbers. Copilot doesn't know that bankruptcy chapters are 7, 11, and 13 — that comes from the domain. The Hibernate 6 `CAST(:debtorName AS String)` fix also came from my own debugging, not from Copilot. The right mental model is: Copilot drafts, I review and own."
+
+> **What they're testing:** Honest, practical experience with AI tools; ability to use them without being dependent on them.
+
+> **Follow-up:** "Have you ever caught Copilot generating insecure code? Can you give an example?"
+
+---
+
 ## 15. 60-Second Final Pitch
 
 > **Rehearse this as a natural, confident close:**
