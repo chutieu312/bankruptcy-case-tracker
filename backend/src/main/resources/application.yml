@@ -47,6 +47,16 @@ logging:
     com.strettodemo: DEBUG
     org.springframework.security: INFO
 
+# ── Spring Actuator (health check for CD pipeline) ───────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+
 # ── Springdoc / Swagger UI ───────────────────────────────────────────────────
 springdoc:
   api-docs:
