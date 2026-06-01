@@ -110,12 +110,12 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ── Deploy to Staging (develop branch auto-deploys) ──────────────────────────
+  # ── Deploy to Staging (main branch auto-deploys) ─────────────────────────────
   deploy-staging:
     name: Deploy → Staging
     runs-on: ubuntu-latest
     needs: [backend-test, frontend-test]
-    if: github.ref == 'refs/heads/develop'
+    if: github.ref == 'refs/heads/main'
     environment:
       name: staging
       url: https://bct-api-staging.onrender.com
