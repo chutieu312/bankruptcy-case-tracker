@@ -124,6 +124,50 @@ docker compose down -v
 
 ---
 
+## Local Dev Tools
+
+These tools are **optional** — only needed for manually inspecting LocalStack (S3/SQS) from your host machine. The app runs fine without them via `docker compose up`.
+
+| Tool | What it does | Install |
+|---|---|---|
+| `awslocal` | AWS CLI wrapper pre-configured to hit LocalStack at `localhost:4566` | `pip install awscli-local` |
+| `aws` (full CLI) | Standard AWS CLI — needed if you want to use `--endpoint-url` manually | [docs.aws.amazon.com/cli](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) |
+
+### Inspect the SQS queue (after a status change)
+
+```bash
+# Option A — using awslocal (host machine, requires pip install awscli-local)
+awslocal sqs receive-message \
+  --queue-url http://localhost:4566/000000000000/case-notifications \
+  --max-number-of-messages 10
+
+# Option B — using the LocalStack container directly (no host install needed)
+docker compose exec localstack awslocal sqs receive-message \
+  --queue-url http://sqs.us-east-1.localhost.localstack.cloud:4566/000000000000/case-notifications \
+  --max-number-of-messages 10
+```
+
+### Inspect the S3 bucket (after a document upload)
+
+```bash
+# Option A — awslocal
+awslocal s3 ls s3://case-documents/
+
+# Option B — via container
+docker compose exec localstack awslocal s3 ls s3://case-documents/
+```
+
+### Check Spring Boot logs for SQS confirmation
+
+```bash
+docker compose logs api | grep "SQS notification"
+# Expected: SQS notification sent for case 2024-BK-00001: OPEN -> CLOSED
+```
+
+> **Trigger a message:** Change a case status in the UI (`localhost:3000`) — this calls `PATCH /api/cases/:id/status` which fires `NotificationService.sendCaseStatusChangeNotification()` asynchronously.
+
+---
+
 ## Local Dev (no Docker)
 
 ### Prerequisites
